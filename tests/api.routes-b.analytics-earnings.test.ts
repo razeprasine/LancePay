@@ -16,7 +16,7 @@ vi.mock('@/lib/db', () => ({
 }))
 
 vi.mock('../../app/api/routes-b/_lib/with-request-id', () => ({
-  withRequestId: (handler: Function) => handler,
+  withRequestId: (handler: (req: NextRequest) => Promise<Response>) => handler,
 }))
 
 vi.mock('../../app/api/routes-b/_lib/with-compression', () => ({
