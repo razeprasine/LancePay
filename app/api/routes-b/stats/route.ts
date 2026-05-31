@@ -12,6 +12,21 @@ import { withCompression } from '../_lib/with-compression'
 import { errorResponse } from '../_lib/errors'
 import { parseUtcDateRange } from '../_lib/date-range'
 import { z } from 'zod'
+import { getUtcPeriodBoundaries, calculateDelta, PeriodType } from '../_lib/period'
+
+const MetricDeltaSchema = z.object({
+  current: z.number(),
+  previous: z.number(),
+  deltaPct: z.number(),
+})
+
+const InvoicesDeltaSchema = z.object({
+  total: MetricDeltaSchema,
+  pending: MetricDeltaSchema,
+  paid: MetricDeltaSchema,
+  cancelled: MetricDeltaSchema,
+  overdue: MetricDeltaSchema,
+})
 
 // Register OpenAPI documentation
 registerRoute({
@@ -20,17 +35,26 @@ registerRoute({
   summary: 'Get user statistics',
   description:
     'Returns invoice statistics, total earnings, and pending withdrawals for the authenticated user.',
-  responseSchema: z.object({
-    invoices: z.object({
-      total: z.number(),
-      pending: z.number(),
-      paid: z.number(),
-      cancelled: z.number(),
-      overdue: z.number(),
+  responseSchema: z.union([
+    z.object({
+      invoices: z.object({
+        total: z.number(),
+        pending: z.number(),
+        paid: z.number(),
+        cancelled: z.number(),
+        overdue: z.number(),
+      }),
+      totalEarned: z.number(),
+      pendingWithdrawals: z.number(),
     }),
-    totalEarned: z.number(),
-    pendingWithdrawals: z.number(),
-  }),
+    z.object({
+      period: z.enum(['day', 'week', 'month', 'year']),
+      invoices: InvoicesDeltaSchema,
+      totalEarned: MetricDeltaSchema,
+      pendingWithdrawals: MetricDeltaSchema,
+      _note: z.string().optional(),
+    }),
+  ]),
   tags: ['stats'],
 })
 
@@ -97,9 +121,54 @@ async function GETHandler(request: NextRequest) {
         }),
       ])
 
-    const counts = Object.fromEntries(
-      invoiceStats.map(s => [s.status, s._count.id]),
-    )
+    if (!usePeriod) {
+      const [invoiceStats, totalEarned, pendingWithdrawals] = await Promise.all([
+        prisma.invoice.groupBy({
+          by: ['status'],
+          where: { userId: user.id },
+          _count: { id: true },
+        }),
+        prisma.transaction.aggregate({
+          where: { userId: user.id, type: 'payment', status: 'completed' },
+          _sum: { amount: true },
+        }),
+        prisma.transaction.count({
+          where: { userId: user.id, type: 'withdrawal', status: 'pending' },
+        }),
+      ])
+
+      const counts = Object.fromEntries(invoiceStats.map((s) => [s.status, s._count.id]))
+
+      payload = {
+        invoices: {
+          total: invoiceStats.reduce((sum, s) => sum + s._count.id, 0),
+          pending: counts.pending ?? 0,
+          paid: counts.paid ?? 0,
+          cancelled: counts.cancelled ?? 0,
+          overdue: counts.overdue ?? 0,
+        },
+        totalEarned: Number(totalEarned._sum.amount ?? 0),
+        pendingWithdrawals,
+      }
+    } else {
+      const boundaries = getUtcPeriodBoundaries(period)
+
+      const fetchStats = async (start: Date, end: Date) => {
+        const where = { userId: user.id, createdAt: { gte: start, lt: end } }
+        const [invoiceStats, totalEarned, pendingWithdrawals] = await Promise.all([
+          prisma.invoice.groupBy({
+            by: ['status'],
+            where,
+            _count: { id: true },
+          }),
+          prisma.transaction.aggregate({
+            where: { ...where, type: 'payment', status: 'completed' },
+            _sum: { amount: true },
+          }),
+          prisma.transaction.count({
+            where: { ...where, type: 'withdrawal', status: 'pending' },
+          }),
+        ])
 
     const currentStats: StatsPayload = {
       invoices: {
